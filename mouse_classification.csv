@@ -1,0 +1,16 @@
+Mouse_ID,Strain,Treatment,Cage_Number
+m19,C57BL/6,Grazing,0101
+m20,C57BL/6,Meal-Fed,0102
+m24,LoxTB-GHSR,Grazing,0103
+m25,LoxTB-GHSR,Meal-Fed,0104
+m26,C57BL/6,Meal-Fed,0101
+m27,LoxTB-GHSR,Grazing,0102
+m28,LoxTB-GHSR,Meal-Fed,0103
+m29,LoxTB-GHSR,Meal-Fed,0104
+m31,C57BL/6,Grazing,0101
+m32,C57BL/6,Meal-Fed,0102
+m33,C57BL/6,Meal-Fed,0103
+m34,LoxTB-GHSR,Meal-Fed,0104
+m35,C57BL/6,Grazing,0101
+m36,C57BL/6,Meal-Fed,0102
+m37,LoxTB-GHSR,Meal-Fed,0103
