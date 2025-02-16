@@ -3,6 +3,13 @@ import numpy as np
 from datetime import datetime, timedelta
 import os
 
+def is_same_experimental_day(time1, time2):
+    """Check if two timestamps belong to the same experimental day"""
+    # If second time is between midnight and 6am, consider it part of previous day
+    if 0 <= time2.hour < 6:
+        time2 = time2 - timedelta(days=1)
+    return time1.date() == time2.date()
+
 def get_mouse_info():
     """Get mouse info from Excel"""
     xl = pd.ExcelFile('Experiment m Data Summary.xlsx')
@@ -17,118 +24,230 @@ def get_mouse_info():
                 date = row['Date']
                 if isinstance(date, str):
                     date = datetime.strptime(date, '%d/%m/%Y')
+                elif isinstance(date, datetime):
+                    pass
+                else:
+                    try:
+                        date = datetime.fromordinal(datetime(1900, 1, 1).toordinal() + int(date) - 2)
+                    except:
+                        continue
+                
                 mouse_info[mouse_id] = {
                     'start_date': date,
                     'strain': row['Strain'],
-                    'treatment': row['Treatment']
+                    'treatment': row['Treatment'],
+                    'meals': {
+                        'D1': {'18:00-19:00': [], '23:30-00:30': [], '05:00-06:00': []},
+                        'D7': {'18:00-19:00': [], '23:30-00:30': [], '05:00-06:00': []},
+                        'D14': {'18:00-19:00': [], '23:30-00:30': [], '05:00-06:00': []},
+                        'D20': {'18:00-19:00': [], '23:30-00:30': [], '05:00-06:00': []}
+                    }
                 }
     return mouse_info
 
-def process_feed_file(file_path, target_date):
-    """Process a single FEED1 file for a specific date"""
-    experiment_start = None
-    cage_to_mouse = {}
-    daily_data = {}
+def get_meal_window(timestamp):
+    """Get which meal window a timestamp belongs to"""
+    hour = timestamp.hour
+    minute = timestamp.minute
+    
+    if hour == 18:
+        return '18:00-19:00'
+    elif (hour == 23 and minute >= 30) or (hour == 0 and minute <= 30):
+        return '23:30-00:30'
+    elif hour == 5:
+        return '05:00-06:00'
+    return None
+
+def process_feed_file(file_path, mouse_info):
+    """Process a single feed file and extract meal data"""
+    print(f"\nProcessing file: {file_path}")
     
     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
-        
-        # Get metadata
-        for line in lines:
-            line = line.strip()
-            if 'EXPERIMENT START:' in line:
-                experiment_start = datetime.strptime(line.split(':', 1)[1].strip(), '%d/%m/%Y %H:%M:%S')
-                if experiment_start.date() != target_date.date():
-                    return None, {}
-            elif 'GROUP/CAGE:' in line:
-                current_cage = line.split(':')[1].strip()
-            elif 'SUBJECT ID:' in line:
-                mouse_id = line.split(':')[1].strip().replace('Mouse ', '').strip()
-                if mouse_id and mouse_id != 'Empty':
-                    cage_to_mouse[current_cage] = mouse_id
-                    daily_data[mouse_id] = {
-                        '18:00-19:00': [],
-                        '23:30-00:30': [],
-                        '05:00-06:00': []
-                    }
-        
-        # Process data section
-        data_start = False
-        for line in lines:
-            if ':DATA' in line:
-                data_start = True
-                continue
-            if data_start and ',' in line and '===' not in line and 'INTERVAL' not in line:
-                parts = [p.strip() for p in line.split(',')]
-                if len(parts) >= 9:
-                    try:
-                        time = datetime.strptime(parts[1], '%d/%m/%Y %H:%M:%S')
-                        hour = time.hour
-                        minute = time.minute
-                        
-                        # Process each cage
-                        for i in range(2, 9, 3):
-                            cage = parts[i]
-                            if cage in cage_to_mouse:
-                                mouse_id = cage_to_mouse[cage]
-                                value = float(parts[i+1]) if parts[i+1].strip() else 0
-                                
-                                # Check time windows
-                                if (hour == 18 and 0 <= minute < 60):
-                                    daily_data[mouse_id]['18:00-19:00'].append(value)
-                                elif (hour == 23 and 30 <= minute < 60) or (hour == 0 and 0 <= minute <= 30):
-                                    daily_data[mouse_id]['23:30-00:30'].append(value)
-                                elif (hour == 5 and 0 <= minute < 60):
-                                    daily_data[mouse_id]['05:00-06:00'].append(value)
-                    except:
-                        continue
     
-    return experiment_start, daily_data
+    # Get metadata
+    experiment_start = None
+    cage_to_mouse = {}
+    for line in lines:
+        line = line.strip()
+        if 'EXPERIMENT START:' in line:
+            experiment_start = datetime.strptime(line.split(':', 1)[1].strip(), '%d/%m/%Y %H:%M:%S')
+            print(f"File start: {experiment_start}")
+        elif 'GROUP/CAGE:' in line:
+            current_cage = line.split(':')[1].strip()
+        elif 'SUBJECT ID:' in line and 'current_cage' in locals():
+            mouse_id = line.split(':')[1].strip().replace('Mouse ', '').strip()
+            if mouse_id in mouse_info:
+                cage_to_mouse[current_cage] = mouse_id
+                print(f"Found {mouse_id} in cage {current_cage}")
+    
+    # Find cage columns
+    header = None
+    cage_columns = {}
+    data_start = False
+    
+    for line in lines:
+        if ':DATA' in line:
+            data_start = True
+            continue
+        if data_start and 'INTERVAL' in line:
+            header = line.strip().split(',')
+            for i, col in enumerate(header):
+                for cage in cage_to_mouse:
+                    if f"CAGE {cage}" in col:
+                        cage_columns[cage] = {
+                            'time_col': i-1,
+                            'value_col': i
+                        }
+            break
+    
+    # Process data
+    for mouse_id in cage_to_mouse.values():
+        print(f"\nProcessing data for mouse {mouse_id}")
+        mouse_data = mouse_info[mouse_id]
+        start_date = mouse_data['start_date']
+        
+        # Calculate target dates
+        target_dates = {
+            'D1': start_date,
+            'D7': start_date + timedelta(days=6),
+            'D14': start_date + timedelta(days=13),
+            'D20': start_date + timedelta(days=19)
+        }
+        
+        for line in lines:
+            if not data_start or '===' in line or 'INTERVAL' in line or not line:
+                continue
+                
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) < 9:
+                continue
+                
+            # Find mouse's cage
+            mouse_cage = None
+            for cage, mouse in cage_to_mouse.items():
+                if mouse == mouse_id:
+                    mouse_cage = cage
+                    break
+                    
+            if not mouse_cage:
+                continue
+                
+            cols = cage_columns[mouse_cage]
+            
+            try:
+                timestamp = datetime.strptime(parts[cols['time_col']], '%d/%m/%Y %H:%M:%S')
+                value = float(parts[cols['value_col']].replace('E-', 'e-'))
+                
+                if value <= 0.02:  # Skip insignificant values
+                    continue
+                    
+                # Check if this is a feeding window
+                window = get_meal_window(timestamp)
+                if not window:
+                    continue
+                    
+                # Match to experimental day
+                for day, target_date in target_dates.items():
+                    if is_same_experimental_day(target_date, timestamp):
+                        mouse_data['meals'][day][window].append(value)
+                        print(f"Added {value:.2f}g to {day} {window}")
+                        
+            except Exception as e:
+                continue
+    
+    return mouse_info
+
+def create_summary_sheets(mouse_info):
+    """Create summary DataFrames for each day"""
+    day_data = {day: [] for day in ['D1', 'D7', 'D14', 'D20']}
+    
+    for mouse_id, info in mouse_info.items():
+        if info['treatment'] == 'Meal-Fed':
+            strain_prefix = 'WT' if info['strain'] == 'C57BL/6' else 'GHSR'
+            treatment = f"{strain_prefix}-{info['treatment']}"
+            
+            for day in ['D1', 'D7', 'D14', 'D20']:
+                meals = info['meals'][day]
+                meal1 = round(sum(meals['18:00-19:00']), 2)
+                meal2 = round(sum(meals['23:30-00:30']), 2)
+                meal3 = round(sum(meals['05:00-06:00']), 2)
+                
+                if meal1 > 0 or meal2 > 0 or meal3 > 0:  # Only add if there's data
+                    day_data[day].append({
+                        'Animal #': mouse_id[1:],  # Remove 'm' prefix
+                        'Treatment': treatment,
+                        'Date': info['start_date'].strftime('%d/%m/%y'),
+                        'Meal 1': meal1,
+                        'Meal 2': meal2,
+                        'Meal 3': meal3
+                    })
+    
+    # Convert to DataFrames
+    summary_dfs = {}
+    for day, data in day_data.items():
+        if data:  # Only create sheet if there's data
+            df = pd.DataFrame(data)
+            
+            # Calculate means and SEMs by treatment
+            means = df.groupby('Treatment')[['Meal 1', 'Meal 2', 'Meal 3']].mean().round(2)
+            sems = df.groupby('Treatment')[['Meal 1', 'Meal 2', 'Meal 3']].sem().round(2)
+            
+            summary_dfs[day] = {
+                'data': df,
+                'means': means,
+                'sems': sems
+            }
+    
+    return summary_dfs
 
 def main():
     # Get mouse info
     mouse_info = get_mouse_info()
     
-    # Initialize results
-    results = []
+    # Process feed files
+    feed_files = [f for f in os.listdir('.') if f.endswith('.CSV') and 'FEED1' in f]
+    for file in feed_files:
+        mouse_info = process_feed_file(file, mouse_info)
     
-    # Process each mouse
+    # Create summary sheets
+    summary_dfs = create_summary_sheets(mouse_info)
+    
+    # Print raw data for verification
+    print("\nRaw meal data:")
     for mouse_id, info in mouse_info.items():
-        target_date = info['start_date']
-        
-        # Create base record
-        record = {
-            'Animal #': mouse_id,
-            'Treatment': f"{info['strain']}-{info['treatment']}",
-            'Date': target_date.strftime('%d/%m/%y'),
-            '18:00-19:00': 0,
-            '18:00-19:00_Total': 0,
-            '23:30-00:30': 0,
-            '23:30-00:30_Total': 0,
-            '05:00-06:00': 0,
-            '05:00-06:00_Total': 0
-        }
-        
-        # Find and process relevant feed files
-        feed_files = [f for f in os.listdir('.') if f.endswith('.CSV') and 'FEED1' in f]
-        for file in feed_files:
-            start_date, data = process_feed_file(file, target_date)
-            if start_date and mouse_id in data:
-                mouse_data = data[mouse_id]
-                for window in ['18:00-19:00', '23:30-00:30', '05:00-06:00']:
-                    values = mouse_data[window]
-                    if values:
-                        # Calculate average and total for each time window
-                        record[window] = np.mean(values)
-                        record[f"{window}_Total"] = sum(values)
-        
-        results.append(record)
+        if info['treatment'] == 'Meal-Fed':
+            print(f"\n{mouse_id}:")
+            for day in ['D1', 'D7', 'D14', 'D20']:
+                meals = info['meals'][day]
+                meal1 = sum(meals['18:00-19:00'])
+                meal2 = sum(meals['23:30-00:30'])
+                meal3 = sum(meals['05:00-06:00'])
+                if meal1 > 0 or meal2 > 0 or meal3 > 0:
+                    print(f"\n{day}:")
+                    if meal1 > 0: print(f"Meal 1 (18:00-19:00): {meal1:.2f}g")
+                    if meal2 > 0: print(f"Meal 2 (23:30-00:30): {meal2:.2f}g")
+                    if meal3 > 0: print(f"Meal 3 (05:00-06:00): {meal3:.2f}g")
     
-    # Create DataFrame and save
-    df = pd.DataFrame(results)
-    df.to_csv('mouse_feeding_data.csv', index=False)
-    print("\nProcessed data:")
-    print(df)
+    # Save to Excel with a default sheet if no data
+    with pd.ExcelWriter('meal_analysis.xlsx') as writer:
+        if not summary_dfs:
+            pd.DataFrame().to_excel(writer, sheet_name='No Data')
+        else:
+            for day, dfs in summary_dfs.items():
+                # Write main data
+                start_row = 0
+                dfs['data'].to_excel(writer, sheet_name=day, startrow=start_row, index=False)
+                
+                # Write means
+                start_row = len(dfs['data']) + 2
+                dfs['means'].to_excel(writer, sheet_name=day, startrow=start_row)
+                
+                # Write SEMs
+                start_row = start_row + len(dfs['means']) + 2
+                dfs['sems'].to_excel(writer, sheet_name=day, startrow=start_row)
+    
+    print("\nAnalysis complete. Results saved to meal_analysis.xlsx")
 
 if __name__ == "__main__":
     main()
