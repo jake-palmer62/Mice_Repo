@@ -1,98 +1,224 @@
 import pandas as pd
 import numpy as np
+from datetime import datetime, timedelta
 import os
 
-def extract_cage_info():
-    """Extract cage numbers from CSV files"""
-    csv_files = [f for f in os.listdir('.') if f.endswith('.CSV') and 'FEED1' in f]
-    cage_data = []
+def get_mouse_info():
+    """Get mouse info from Excel"""
+    xl = pd.ExcelFile('Experiment m Data Summary.xlsx')
+    wt_df = pd.read_excel(xl, '(WT) Food intake', header=2)
+    hom_df = pd.read_excel(xl, '(HOM) Food intake', header=2)
     
-    print("Processing CSV files for cage numbers...")
-    for file in csv_files:
-        with open(file, 'r') as f:
-            content = f.readlines()[:30]
-            current_cage = None
-            
-            for line in content:
-                if 'GROUP/CAGE:' in line:
-                    current_cage = line.split(':')[1].strip()
-                elif 'SUBJECT ID:' in line:
-                    mouse_id = line.split(':')[1].strip()
-                    if mouse_id and mouse_id != 'Empty' and current_cage:
-                        mouse_id = mouse_id.replace('Mouse ', '').strip()
-                        if mouse_id:
-                            cage_data.append({
-                                'Mouse_ID': mouse_id,
-                                'Cage_Number': current_cage
-                            })
-    
-    return pd.DataFrame(cage_data).drop_duplicates()
+    mouse_info = {}
+    for df in [wt_df, hom_df]:
+        for _, row in df.iterrows():
+            mouse_id = str(row['Animal #']).strip()
+            if mouse_id.startswith('m'):
+                date = row['Date']
+                if isinstance(date, str):
+                    date = datetime.strptime(date, '%d/%m/%Y')
+                elif isinstance(date, datetime):
+                    pass
+                else:
+                    try:
+                        date = datetime.fromordinal(datetime(1900, 1, 1).toordinal() + int(date) - 2)
+                    except:
+                        continue
+                
+                mouse_info[mouse_id] = {
+                    'start_date': date,
+                    'strain': row['Strain'],
+                    'treatment': row['Treatment'],
+                    'meals': {
+                        'D1': {'18:00-19:00': [], '23:30-00:30': [], '05:00-06:00': []},
+                        'D7': {'18:00-19:00': [], '23:30-00:30': [], '05:00-06:00': []},
+                        'D14': {'18:00-19:00': [], '23:30-00:30': [], '05:00-06:00': []},
+                        'D20': {'18:00-19:00': [], '23:30-00:30': [], '05:00-06:00': []}
+                    }
+                }
+    return mouse_info
 
-def extract_mouse_data(excel_file):
-    """Extract mouse data from Data Summary (Both) sheet"""
-    print("\nReading Excel data...")
+def process_feed_file(file_path, mouse_info):
+    """Process a single feed file and extract meal data"""
+    print(f"\nProcessing file: {file_path}")
     
-    # Read the Excel file
-    df = pd.read_excel(excel_file, sheet_name='Data Summary (Both)', header=None)
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        lines = f.readlines()
     
-    # Find the row containing "Animal #" and "Strain" and "Treatment"
-    header_row = None
-    for idx, row in df.iterrows():
-        if 'Animal #' in row.values:
-            header_row = idx
+    # Get metadata and cage mappings
+    experiment_start = None
+    cage_to_mouse = {}
+    current_cage = None
+    
+    for line in lines:
+        line = line.strip()
+        if 'EXPERIMENT START:' in line:
+            experiment_start = datetime.strptime(line.split(':', 1)[1].strip(), '%d/%m/%Y %H:%M:%S')
+            print(f"Experiment start: {experiment_start}")
+        elif 'GROUP/CAGE:' in line:
+            current_cage = line.split(':')[1].strip()
+        elif 'SUBJECT ID:' in line and current_cage:
+            mouse_id = line.split(':')[1].strip().replace('Mouse ', '').strip()
+            if mouse_id and mouse_id != 'Empty':
+                cage_to_mouse[current_cage] = mouse_id
+                print(f"Found mouse {mouse_id} in cage {current_cage}")
+    
+    # Map cage columns
+    data_start = False
+    column_mapping = {}
+    
+    for line in lines:
+        if ':DATA' in line:
+            data_start = True
+            continue
+        if data_start and 'INTERVAL' in line:
+            parts = line.strip().split(',')
+            for i, part in enumerate(parts):
+                for cage in cage_to_mouse:
+                    if f"CAGE {cage}" in part:
+                        column_mapping[cage] = {
+                            'time_col': i-1,
+                            'value_col': i
+                        }
             break
     
-    if header_row is None:
-        raise ValueError("Could not find header row with 'Animal #'")
+    # Process data
+    for line in lines:
+        if data_start and not 'INTERVAL' in line and not '===' in line and line.strip():
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) < 9:
+                continue
+            
+            for cage, mouse_id in cage_to_mouse.items():
+                if cage in column_mapping:
+                    cols = column_mapping[cage]
+                    try:
+                        timestamp = datetime.strptime(parts[cols['time_col']], '%d/%m/%Y %H:%M:%S')
+                        value = float(parts[cols['value_col']].replace('E-', 'e-'))
+                        
+                        if value <= 0.02:  # Skip small/negative values
+                            continue
+                            
+                        # Get time window
+                        hour = timestamp.hour
+                        minute = timestamp.minute
+                        window = None
+                        
+                        if hour == 18:
+                            window = '18:00-19:00'
+                        elif (hour == 23 and minute >= 30) or (hour == 0 and minute <= 30):
+                            window = '23:30-00:30'
+                        elif hour == 5:
+                            window = '05:00-06:00'
+                            
+                        if not window:
+                            continue
+                            
+                        # Determine which experimental day
+                        if mouse_id in mouse_info:
+                            days_diff = (timestamp.date() - mouse_info[mouse_id]['start_date'].date()).days + 1
+                            
+                            if days_diff in [1, 7, 14, 20]:
+                                day_key = f'D{days_diff}'
+                                mouse_info[mouse_id]['meals'][day_key][window].append(value)
+                                
+                    except Exception as e:
+                        continue
     
-    # Read data with correct header
-    df = pd.read_excel(excel_file, sheet_name='Data Summary (Both)', header=header_row)
+    return mouse_info
+
+def create_summary_sheets(mouse_info):
+    """Create summary DataFrames for each day"""
+    day_data = {day: [] for day in ['D1', 'D7', 'D14', 'D20']}
     
-    # Clean column names
-    df.columns = [str(col).strip() for col in df.columns]
+    for mouse_id, info in mouse_info.items():
+        if info['treatment'] == 'Meal-Fed':
+            strain_prefix = 'WT' if info['strain'] == 'C57BL/6' else 'GHSR'
+            treatment = f"{strain_prefix}-{info['treatment']}"
+            
+            for day in ['D1', 'D7', 'D14', 'D20']:
+                windows = info['meals'][day]
+                day_data[day].append({
+                    'Animal #': mouse_id[1:],  # Remove 'm' prefix
+                    'Treatment': treatment,
+                    'Date': info['start_date'].strftime('%d/%m/%y'),
+                    '18:00-19:00': round(sum(windows['18:00-19:00']), 2),
+                    '23:30-00:30': round(sum(windows['23:30-00:30']), 2),
+                    '05:00-06:00': round(sum(windows['05:00-06:00']), 2),
+                    '18:00-19:00_Total': sum(windows['18:00-19:00']),
+                    '23:30-00:30_Total': sum(windows['23:30-00:30']),
+                    '05:00-06:00_Total': sum(windows['05:00-06:00'])
+                })
     
-    # Select and rename relevant columns
-    mouse_data = df[['Animal #', 'Strain', 'Treatment']].copy()
-    mouse_data.columns = ['Mouse_ID', 'Strain', 'Treatment']
+    # Convert to DataFrames
+    summary_dfs = {}
+    for day, data in day_data.items():
+        if data:  # Only create sheet if there's data
+            df = pd.DataFrame(data)
+            
+            # Add means and SEMs
+            means = df.groupby('Treatment')[['18:00-19:00', '23:30-00:30', '05:00-06:00', 
+                                           '18:00-19:00_Total', '23:30-00:30_Total', '05:00-06:00_Total']].mean().round(2)
+            sems = df.groupby('Treatment')[['18:00-19:00', '23:30-00:30', '05:00-06:00',
+                                          '18:00-19:00_Total', '23:30-00:30_Total', '05:00-06:00_Total']].sem().round(2)
+            
+            summary_dfs[day] = {
+                'data': df,
+                'means': means,
+                'sems': sems
+            }
     
-    # Clean the data
-    mouse_data = mouse_data.dropna(subset=['Mouse_ID'])
-    mouse_data = mouse_data[mouse_data['Mouse_ID'].astype(str).str.match(r'^m\d+$')]
-    
-    # Remove any duplicate mouse IDs
-    mouse_data = mouse_data.drop_duplicates(subset=['Mouse_ID'])
-    
-    return mouse_data
+    return summary_dfs
 
 def main():
-    try:
-        # Get cage info
-        cage_df = extract_cage_info()
-        print("\nCage data:")
-        print(cage_df)
-        
-        # Get mouse data from Excel
-        mouse_data = extract_mouse_data('Experiment m Data Summary.xlsx')
-        print("\nMouse data from Excel:")
-        print(mouse_data)
-        
-        # Merge data
-        final_data = mouse_data.merge(cage_df, on='Mouse_ID', how='left')
-        
-        # Save result
-        final_data.to_csv('mouse_classification.csv', index=False)
-        print("\nFinal classification data:")
-        print(final_data)
-        print("\nClassification saved to mouse_classification.csv")
-        
-        # Print missing cage numbers
-        missing_cages = final_data[final_data['Cage_Number'].isna()]['Mouse_ID'].tolist()
-        if missing_cages:
-            print("\nMice missing cage numbers:")
-            print(missing_cages)
+    # Get mouse info
+    mouse_info = get_mouse_info()
+    
+    # Process feed files
+    feed_files = [f for f in os.listdir('.') if f.endswith('.CSV') and 'FEED1' in f]
+    for file in feed_files:
+        mouse_info = process_feed_file(file, mouse_info)
+    
+    # Create summary sheets
+    summary_dfs = create_summary_sheets(mouse_info)
+    
+    # Print raw data for verification
+    print("\nMeal summaries:")
+    for mouse_id, info in mouse_info.items():
+        if info['treatment'] == 'Meal-Fed':
+            has_data = False
+            data_str = [f"\n{mouse_id}:"]
             
-    except Exception as e:
-        print(f"Error: {e}")
+            for day in ['D1', 'D7', 'D14', 'D20']:
+                meals = info['meals'][day]
+                if any(len(m) > 0 for m in meals.values()):
+                    has_data = True
+                    data_str.append(f"\n{day}:")
+                    for window, values in meals.items():
+                        if values:
+                            total = sum(values)
+                            if total > 0:
+                                data_str.append(f"  {window}: {total:.2f}g ({len(values)} events)")
+            
+            if has_data:
+                print('\n'.join(data_str))
+    
+    # Save to Excel
+    with pd.ExcelWriter('meal_analysis.xlsx') as writer:
+        for day, dfs in summary_dfs.items():
+            # Write main data
+            start_row = 0
+            dfs['data'].to_excel(writer, sheet_name=day, startrow=start_row, index=False)
+            
+            # Write means
+            start_row = len(dfs['data']) + 2
+            dfs['means'].to_excel(writer, sheet_name=day, startrow=start_row)
+            
+            # Write SEMs
+            start_row = start_row + len(dfs['means']) + 2
+            dfs['sems'].to_excel(writer, sheet_name=day, startrow=start_row)
+    
+    print("\nAnalysis complete. Results saved to meal_analysis.xlsx")
 
 if __name__ == "__main__":
     main()
