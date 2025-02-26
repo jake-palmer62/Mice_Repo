@@ -129,10 +129,14 @@ def process_feed_file(file_path, mouse_info):
     return mouse_info
 
 def create_summary_sheets(mouse_info):
-    """Create summary DataFrames for each day"""
+    """Create summary DataFrames for each day, excluding mice without cage numbers"""
     day_data = {day: [] for day in ['D1', 'D7', 'D14', 'D20']}
     
     for mouse_id, info in mouse_info.items():
+        # Skip mice without a cage number
+        if info['cage'] is None:
+            continue
+            
         strain_prefix = 'WT' if info['strain'] == 'C57BL/6' else 'GHSR'
         treatment = f"{strain_prefix}-{info['treatment']}"
         
@@ -199,11 +203,15 @@ def main():
         print(f"  {file}")
         mouse_info = process_feed_file(file, mouse_info)
     
-    # Print raw data for verification
-    print("\nMeal summaries:")
+    # Print raw data for verification, excluding mice without cage numbers
+    print("\nMeal summaries (mice with cage numbers only):")
     for mouse_id, info in mouse_info.items():
+        # Skip mice without a cage number
+        if info['cage'] is None:
+            continue
+            
         has_data = False
-        data_str = [f"\n{mouse_id} (Cage {info['cage']}):" if info['cage'] else f"\n{mouse_id}:"]
+        data_str = [f"\n{mouse_id} (Cage {info['cage']}):"]
         
         for day in ['D1', 'D7', 'D14', 'D20']:
             meals = info['meals'][day]
@@ -216,10 +224,10 @@ def main():
                         if total > 0:
                             data_str.append(f"  {window}: {total:.2f}g ({len(values)} events)")
         
-        if has_data or info['cage']:  # Show mice even if they have no data
+        if has_data:  # Only show mice with data
             print('\n'.join(data_str))
     
-    # Create summary sheets
+    # Create summary sheets (already excludes mice without cage numbers)
     summary_dfs = create_summary_sheets(mouse_info)
     
     # Save to Excel
